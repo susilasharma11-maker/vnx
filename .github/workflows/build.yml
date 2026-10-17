@@ -1,0 +1,630 @@
+name: build-apk
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK, build-tools, NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.1.10909125"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Scaffold project
+        run: |
+          mkdir -p app/src/main/java/ai/venice/vnx/core
+          mkdir -p app/src/main/java/ai/venice/vnx/native
+          mkdir -p app/src/main/java/ai/venice/vnx/re
+          mkdir -p app/src/main/java/ai/venice/vnx/read
+          mkdir -p app/src/main/java/ai/venice/vnx/overlay
+          mkdir -p app/src/main/java/ai/venice/vnx/antiflag
+          mkdir -p app/src/main/cpp app/src/main/assets app/src/main/res/values
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "VNX"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.0" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          org.gradle.jvmargs=-Xmx3072m
+          EOF
+
+          cat > local.properties <<'EOF'
+          EOF
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "ai.venice.vnx"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "ai.venice.vnx"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+              }
+              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
+              buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation(platform("androidx.compose:compose-bom:2024.10.01"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <queries>
+                  <package android:name="moe.shizuku.privileged.api"/>
+                  <package android:name="com.dts.freefireth"/>
+                  <package android:name="com.dts.freefiremax"/>
+              </queries>
+              <application android:label="@string/app_name" android:theme="@style/Theme.VNX">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".overlay.OverlaySvc"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                                android:value="game overlay panel"/>
+                  </service>
+                  <provider android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:multiprocess="false"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources><string name="app_name">VNX Apex</string></resources>
+          EOF
+
+          cat > app/src/main/res/values/themes.xml <<'EOF'
+          <resources>
+              <style name="Theme.VNX" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">#060709</item>
+                  <item name="android:statusBarColor">#060709</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22)
+          project(vnxmem C)
+          add_executable(vnxmem vnxmem.c)
+          target_compile_options(vnxmem PRIVATE -O2 -static -Wall)
+          EOF
+
+          cat > app/src/main/cpp/vnxmem.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <errno.h>
+          #include <math.h>
+          #include <sys/types.h>
+
+          #define CHUNK (1 << 20)
+          static pid_t g_pid = 0;
+          static int g_fd = -1;
+
+          static int mem_open(pid_t pid) {
+              char p[64];
+              snprintf(p, sizeof p, "/proc/%d/mem", pid);
+              g_fd = open(p, O_RDWR);
+              if (g_fd < 0) { fprintf(stderr, "open %s: %s\n", p, strerror(errno)); return -1; }
+              g_pid = pid; return 0;
+          }
+          static int rd(unsigned long a, void *b, size_t n) {
+              return pread(g_fd, b, n, (off_t)a) == (ssize_t)n ? 0 : -1;
+          }
+          static int rd_stable(unsigned long a, void *b, size_t n) {
+              unsigned char t[4096];
+              if (n > sizeof t) return -1;
+              if (rd(a, b, n)) return -1;
+              if (rd(a, t, n)) return -1;
+              return memcmp(b, t, n) ? -1 : 0;
+          }
+          static int wr(unsigned long a, const void *b, size_t n) {
+              return pwrite(g_fd, b, n, (off_t)a) == (ssize_t)n ? 0 : -1;
+          }
+          static void tracerpid(pid_t pid) {
+              char p[64], line[256];
+              snprintf(p, sizeof p, "/proc/%d/status", pid);
+              FILE *f = fopen(p, "r"); if (!f) return;
+              while (fgets(line, sizeof line, f))
+                  if (!strncmp(line, "TracerPid:", 10)) { printf("%s", line); break; }
+              fclose(f);
+          }
+          static int regions(pid_t pid) {
+              char p[64], line[512];
+              snprintf(p, sizeof p, "/proc/%d/maps", pid);
+              FILE *f = fopen(p, "r"); if (!f) return -1;
+              while (fgets(line, sizeof line, f)) {
+                  unsigned long a, b; char perm[8] = "", path[256] = "";
+                  if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s", &a, &b, perm, path) >= 3)
+                      if (strchr(perm, 'r')) printf("%016lx-%016lx %s %s\n", a, b, perm, path);
+              }
+              fclose(f); return 0;
+          }
+          static unsigned long mod_base(pid_t pid, const char *mod, unsigned long *size) {
+              char p[64], line[512];
+              snprintf(p, sizeof p, "/proc/%d/maps", pid);
+              FILE *f = fopen(p, "r"); if (!f) return 0;
+              unsigned long lo = ~0UL, hi = 0;
+              while (fgets(line, sizeof line, f)) {
+                  unsigned long a, b; char perm[8] = "", path[512] = "";
+                  if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %511s", &a, &b, perm, path) < 3) continue;
+                  if (!strstr(perm, "r-xp") && !strstr(perm, "r--p")) continue;
+                  if (strstr(path, mod)) { if (a < lo) lo = a; if (b > hi) hi = b; }
+              }
+              fclose(f);
+              if (!hi) return 0;
+              if (size) *size = hi - lo;
+              return lo;
+          }
+          static int pat_parse(const char *s, unsigned char *b, signed char *m, int *n) {
+              int i = 0;
+              while (*s && i < 128) {
+                  while (*s == ' ') s++;
+                  if (!*s) break;
+                  if (s[0] == '?' && s[1] == '?') { b[i] = 0; m[i] = 1; s += 2; }
+                  else { unsigned v; if (sscanf(s, "%2x", &v) != 1) break; b[i] = v; m[i] = 0; s += 2; }
+                  i++;
+              }
+              *n = i; return i > 0;
+          }
+          static int pat_find(unsigned long lo, unsigned long hi,
+                              const unsigned char *p, const signed char *m, int n, int max) {
+              unsigned char *buf = malloc(CHUNK + n);
+              if (!buf) return 0;
+              int hits = 0;
+              for (unsigned long a = lo; a + n < hi; a += CHUNK) {
+                  size_t want = (hi - a) < (CHUNK + n) ? (hi - a) : (CHUNK + n);
+                  if (rd(a, buf, want)) continue;
+                  for (size_t o = 0; o + n <= want; o++) {
+                      int ok = 1;
+                      for (int k = 0; k < n; k++) if (!m[k] && buf[o+k] != p[k]) { ok = 0; break; }
+                      if (ok) { printf("%016lx\n", a + o); if (++hits >= max) goto done; }
+                  }
+              }
+          done: free(buf); return hits;
+          }
+          static int hexb(const char *s, unsigned char *o) {
+              int n = 0;
+              while (s[0] && s[1]) { unsigned v; if (sscanf(s, "%2x", &v) != 1) break; o[n++] = v; s += 2; }
+              return n;
+          }
+          static int cmd_aim(pid_t pid, unsigned long cam, unsigned long me,
+                             unsigned long arr, int count, int stride, int posoff,
+                             float smooth, float fov) {
+              if (mem_open(pid)) return 1;
+              float mp[3], cp[2], ep[3];
+              for (;;) {
+                  if (rd(me + posoff, mp, 12)) { usleep(16000); continue; }
+                  if (rd(cam, cp, 8)) { usleep(16000); continue; }
+                  unsigned long best = 0; float bestd = fov * fov;
+                  for (int i = 0; i < count; i++) {
+                      unsigned long e = arr + (unsigned long)i * stride;
+                      if (stride == 8) { if (rd(e, &e, 8)) continue; }
+                      if (rd(e + posoff, ep, 12)) continue;
+                      float dx = ep[0]-mp[0], dz = ep[2]-mp[2];
+                      float d2 = dx*dx + dz*dz;
+                      if (d2 < bestd && d2 > 4.0f) { bestd = d2; best = e; }
+                  }
+                  if (!best) { usleep(16000); continue; }
+                  if (rd(best + posoff, ep, 12)) { usleep(16000); continue; }
+                  float dx = ep[0]-mp[0], dy = (ep[1]+1.65f)-mp[1], dz = ep[2]-mp[2];
+                  float yaw = atan2f(dx, dz) * 57.29578f;
+                  float pitch = atan2f(dy, sqrtf(dx*dx + dz*dz)) * 57.29578f;
+                  float d = yaw - cp[0];
+                  while (d > 180.f) d -= 360.f;
+                  while (d < -180.f) d += 360.f;
+                  float o[2] = { cp[0] + d * smooth, cp[1] + (pitch - cp[1]) * smooth };
+                  wr(cam, o, 8);
+                  usleep(15000);
+              }
+              return 0;
+          }
+          int main(int argc, char **argv) {
+              if (argc < 3) { fprintf(stderr, "usage: vnxmem <tracer|regions|find|read|write|scan|aim> <pid> [args]\n"); return 2; }
+              const char *cmd = argv[1];
+              pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
+              if (!strcmp(cmd, "tracer")) { tracerpid(pid); return 0; }
+              if (!strcmp(cmd, "regions") || !strcmp(cmd, "mods")) return regions(pid);
+              if (!strcmp(cmd, "find") && argc >= 5) {
+                  unsigned long sz = 0;
+                  unsigned long base = mod_base(pid, argv[3], &sz);
+                  if (!base) { fprintf(stderr, "module not found\n"); return 1; }
+                  if (mem_open(pid)) return 1;
+                  unsigned char p[128]; signed char m[128]; int n = 0;
+                  if (!pat_parse(argv[4], p, m, &n)) return 2;
+                  pat_find(base, base + sz, p, m, n, argc >= 6 ? atoi(argv[5]) : 4);
+                  tracerpid(pid); return 0;
+              }
+              if (mem_open(pid)) return 1;
+              if (!strcmp(cmd, "read") && argc >= 5) {
+                  unsigned long a = strtoul(argv[3], NULL, 16);
+                  size_t n = (size_t)strtoul(argv[4], NULL, 10);
+                  unsigned char *b = malloc(n);
+                  if (rd_stable(a, b, n)) { free(b); return 1; }
+                  for (size_t i = 0; i < n; i++) printf("%02x", b[i]);
+                  printf("\n"); tracerpid(pid); free(b); return 0;
+              }
+              if (!strcmp(cmd, "write") && argc >= 5) {
+                  unsigned long a = strtoul(argv[3], NULL, 16);
+                  unsigned char buf[4096]; int n = hexb(argv[4], buf);
+                  if (wr(a, buf, n)) return 1;
+                  printf("ok %d bytes @ %016lx\n", n, a); tracerpid(pid); return 0;
+              }
+              if (!strcmp(cmd, "scan") && argc >= 5) {
+                  unsigned long lo = argc >= 6 ? strtoul(argv[5], NULL, 16) : 0x7a000000UL;
+                  unsigned long hi = argc >= 7 ? strtoul(argv[6], NULL, 16) : 0x80000000UL;
+                  char t = argv[3][0];
+                  size_t esz = (t=='f'||t=='w') ? 4 : 8;
+                  unsigned char pat[8];
+                  if (t=='f') { float f = strtof(argv[4], NULL); memcpy(pat, &f, 4); }
+                  else if (t=='d') { double d = strtod(argv[4], NULL); memcpy(pat, &d, 8); }
+                  else { unsigned long v = strtoul(argv[4], NULL, 0);
+                         for (size_t i = 0; i < esz; i++) pat[i] = (v >> (8*i)) & 0xff; }
+                  unsigned char *buf = malloc(CHUNK); int hits = 0;
+                  for (unsigned long p = lo; p + CHUNK < hi; p += CHUNK) {
+                      if (rd(p, buf, CHUNK)) continue;
+                      for (size_t o = 0; o + esz <= CHUNK; o++)
+                          if (!memcmp(buf + o, pat, esz)) { printf("%016lx\n", p + o); if (++hits >= 400) goto sd; }
+                  }
+              sd: free(buf); return 0;
+              }
+              if (!strcmp(cmd, "aim") && argc >= 11)
+                  return cmd_aim(pid, strtoul(argv[3], NULL, 16), strtoul(argv[4], NULL, 16),
+                                 strtoul(argv[5], NULL, 16), atoi(argv[6]), atoi(argv[7]),
+                                 atoi(argv[8]), strtof(argv[9], NULL), strtof(argv[10], NULL));
+              fprintf(stderr, "unknown cmd %s\n", cmd);
+              return 2;
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/core/Shell.kt <<'EOF'
+          package ai.venice.vnx.core
+          import rikka.shizuku.Shizuku
+          import java.io.BufferedReader
+          import java.io.BufferedWriter
+          object Shell {
+              private var proc: Process? = null
+              private var out: BufferedWriter? = null
+              private var reader: BufferedReader? = null
+              private const val EOF = "__VNX_EOF_9F3A__"
+              fun warm() {
+                  if (proc != null) return
+                  val p = Shizuku.newProcess(arrayOf("sh"), null, null)
+                  proc = p
+                  out = p.outputStream.bufferedWriter()
+                  reader = p.inputStream.bufferedReader()
+                  exec("echo ready")
+              }
+              @Synchronized
+              fun exec(cmd: String): String {
+                  if (proc == null) warm()
+                  val o = out ?: return ""
+                  val r = reader ?: return ""
+                  o.write(cmd + " 2>&1; echo " + EOF + "\n"); o.flush()
+                  val sb = StringBuilder()
+                  while (true) {
+                      val line = r.readLine() ?: break
+                      if (line == EOF) break
+                      sb.append(line).append('\n')
+                  }
+                  return sb.toString()
+              }
+              fun kill() { runCatching { proc?.destroy() }; proc = null; out = null; reader = null }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/core/ShizukuGate.kt <<'EOF'
+          package ai.venice.vnx.core
+          import android.content.pm.PackageManager
+          import rikka.shizuku.Shizuku
+          object ShizukuGate {
+              const val REQ = 4213
+              fun granted(): Boolean = try {
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (t: Throwable) { false }
+              fun request() { runCatching { Shizuku.requestPermission(REQ) } }
+              fun arm() { if (granted()) Shell.warm() else request() }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/core/Auth.kt <<'EOF'
+          package ai.venice.vnx.core
+          import android.content.Context
+          import java.security.MessageDigest
+          object Auth {
+              private const val SALT = "vnx::apex::v1"
+              private fun h(u: String, p: String) =
+                  MessageDigest.getInstance("SHA-256").digest((SALT + "|" + u + "|" + p).toByteArray())
+                      .joinToString("") { "%02x".format(it) }
+              fun seed(c: Context) {
+                  val sp = c.getSharedPreferences("auth", Context.MODE_PRIVATE)
+                  if (!sp.contains("venice")) sp.edit().putString("venice", h("venice", "venice")).apply()
+              }
+              fun verify(c: Context, u: String, p: String): Boolean =
+                  c.getSharedPreferences("auth", Context.MODE_PRIVATE).getString(u, null) == h(u, p)
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/native/Native.kt <<'EOF'
+          package ai.venice.vnx.native
+          import ai.venice.vnx.core.Shell
+          import android.content.Context
+          import rikka.shizuku.Shizuku
+          object Native {
+              private const val DIR = "/data/local/tmp/vnxmem"
+              private var installed = false
+              fun install(ctx: Context, abi: String) {
+                  if (installed) return
+                  val bytes = ctx.assets.open("vnxmem-" + abi).readBytes()
+                  val p = Shizuku.newProcess(arrayOf("sh", "-c", "cat > " + DIR + " && chmod 755 " + DIR), null, null)
+                  p.outputStream.use { it.write(bytes) }
+                  p.waitFor()
+                  installed = true
+              }
+              fun tracer(pid: Int) = Shell.exec(DIR + " tracer " + pid).trim()
+              fun read(pid: Int, a: Long, n: Int) = Shell.exec(DIR + " read " + pid + " " + a.toString(16) + " " + n).trim()
+              fun find(pid: Int, mod: String, pat: String, max: Int = 4) =
+                  Shell.exec(DIR + " find " + pid + " " + mod + " \"" + pat + "\" " + max).lines().filter { it.length >= 12 }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/antiflag/ReportCleaner.kt <<'EOF'
+          package ai.venice.vnx.antiflag
+          import ai.venice.vnx.core.Shell
+          object ReportCleaner {
+              private const val G = "/sdcard/Android/data/com.dts.freefireth"
+              private const val PKG = "com.dts.freefireth"
+              fun run(): List<String> = listOf(
+                  "am force-stop " + PKG,
+                  "rm -rf " + G + "/files/*.log " + G + "/cache/*",
+                  "am start -n " + PKG + "/com.dts.freefireth.FFMainActivity"
+              ).map { it to Shell.exec(it) }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/overlay/OverlaySvc.kt <<'EOF'
+          package ai.venice.vnx.overlay
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.TextView
+          class OverlaySvc : Service() {
+              private lateinit var wm: WindowManager
+              private var hud: TextView? = null
+              private var orb: TextView? = null
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  startForeground(1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  if (hud == null) attach()
+                  return START_STICKY
+              }
+              private fun attach() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val hv = TextView(this).apply { text = "VNX"; setTextColor(0xFF5BF08A.toInt()) }
+                  val hp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT)
+                  wm.addView(hv, hp); hud = hv
+                  val ov = TextView(this).apply {
+                      text = "VNX"; setTextColor(0xFF5BF08A.toInt()); textSize = 9f
+                      setBackgroundColor(0x285BF08A); setPadding(24,24,24,24)
+                  }
+                  val op = WindowManager.LayoutParams(
+                      140, 140, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT).apply { gravity = Gravity.BOTTOM or Gravity.END; x = 40; y = 260 }
+                  wm.addView(ov, op); orb = ov
+              }
+              private fun notif(): Notification {
+                  val ch = NotificationChannel("vnx", "VNX", NotificationManager.IMPORTANCE_LOW)
+                  (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+                  return Notification.Builder(this, "vnx")
+                      .setContentTitle("VNX Apex").setContentText("panel active")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass).build()
+              }
+              override fun onDestroy() {
+                  runCatching { hud?.let { wm.removeView(it) }; orb?.let { wm.removeView(it) } }
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/MainActivity.kt <<'EOF'
+          package ai.venice.vnx
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import ai.venice.vnx.core.Auth
+          import ai.venice.vnx.core.ShizukuGate
+          import ai.venice.vnx.native.Native
+          import ai.venice.vnx.overlay.OverlaySvc
+          import rikka.shizuku.Shizuku
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  Auth.seed(this)
+                  Shizuku.addRequestPermissionResultListener { _, code ->
+                      if (code == PackageManager.PERMISSION_GRANTED) ShizukuGate.arm()
+                  }
+                  setContent { Root() }
+              }
+              override fun onResume() { super.onResume(); ShizukuGate.arm() }
+          }
+          val BG = Color(0xFF060709); val LIME = Color(0xFF5BF08A)
+          @Composable fun Root() {
+              var ok by remember { mutableStateOf(ShizukuGate.granted()) }
+              var user by remember { mutableStateOf("") }
+              var pass by remember { mutableStateOf("") }
+              var logged by remember { mutableStateOf(false) }
+              val ctx = LocalContext.current
+              MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = Color(0xFF0C0E12))) {
+                  Surface(Modifier.fillMaxSize().background(BG), color = BG) {
+                      Column(Modifier.padding(18.dp).verticalScroll(rememberScrollState())) {
+                          Text("VNX APEX", color = LIME, fontSize = 20.sp, fontFamily = FontFamily.Monospace)
+                          Spacer(Modifier.height(14.dp))
+                          if (!ok) {
+                              Text("SHIZUKU NOT RUNNING", color = Color(0xFFF2604E), fontFamily = FontFamily.Monospace)
+                              Spacer(Modifier.height(8.dp))
+                              Button(onClick = { ShizukuGate.request() }) { Text("Request / Retry") }
+                          } else if (!logged) {
+                              OutlinedTextField(user, { user = it }, label = { Text("username") }, Modifier.fillMaxWidth())
+                              Spacer(Modifier.height(8.dp))
+                              OutlinedTextField(pass, { pass = it }, label = { Text("password") }, Modifier.fillMaxWidth())
+                              Spacer(Modifier.height(12.dp))
+                              Button(onClick = { if (Auth.verify(ctx, user, pass)) logged = true }, Modifier.fillMaxWidth()) { Text("UNLOCK") }
+                          } else { Panel(ctx) }
+                      }
+                  }
+              }
+          }
+          @Composable fun Panel(ctx: android.content.Context) {
+              var status by remember { mutableStateOf("idle") }
+              Text("status: " + status, color = LIME, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+              Spacer(Modifier.height(14.dp))
+              Button(Modifier.fillMaxWidth(), onClick = {
+                  runCatching { Native.install(ctx, Build.SUPPORTED_ABIS.first()); status = "helper installed" }
+                      .onFailure { status = "install failed: " + it.message }
+              }) { Text("1 · INSTALL HELPER") }
+              Spacer(Modifier.height(8.dp))
+              Button(Modifier.fillMaxWidth(), onClick = {
+                  val r = ai.venice.vnx.core.Shell.exec("pidof com.dts.freefireth").trim()
+                  status = if (r.isEmpty()) "game not running" else "game pid " + r
+              }) { Text("2 · DETECT GAME") }
+              Spacer(Modifier.height(8.dp))
+              Button(Modifier.fillMaxWidth(), onClick = {
+                  val pid = ai.venice.vnx.core.Shell.exec("pidof com.dts.freefireth").trim().toIntOrNull()
+                  status = if (pid == null) "game not running" else "TracerPid = " + Native.tracer(pid)
+              }) { Text("3 · VERIFY ZERO-SURFACE") }
+              Spacer(Modifier.height(8.dp))
+              Button(Modifier.fillMaxWidth(), onClick = {
+                  ctx.startForegroundService(Intent(ctx, OverlaySvc::class.java)); status = "overlay started"
+              }) { Text("4 · START OVERLAY") }
+              Spacer(Modifier.height(8.dp))
+              Button(Modifier.fillMaxWidth(), onClick = {
+                  status = "ghost: " + ai.venice.vnx.antiflag.ReportCleaner.run().size + " steps"
+              }) { Text("5 · GHOST / DELETE REPORT") }
+          }
+          EOF
+
+          echo "scaffold complete"
+
+      - name: Build native helpers (3 ABIs)
+        run: |
+          NDK="$ANDROID_HOME/ndk/26.1.10909125"
+          OUT=app/src/main/assets
+          mkdir -p "$OUT"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" -O2 -static -o "$OUT/vnxmem-arm64-v8a" app/src/main/cpp/vnxmem.c
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang" -O2 -static -o "$OUT/vnxmem-armeabi-v7a" app/src/main/cpp/vnxmem.c
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang" -O2 -static -o "$OUT/vnxmem-x86_64" app/src/main/cpp/vnxmem.c
+          ls -la "$OUT"
+
+      - name: Build APK
+        run: gradle assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnx-apk
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
